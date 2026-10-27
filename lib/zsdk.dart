@@ -542,7 +542,7 @@ class ZSDK {
     final result = await _channel.invokeMethod(_GET_PRINTER_LANGUAGE_OVER_BLUETOOTH, {
       _macAddress: macAddress,
     }).timeout(
-        timeout ??= const Duration(seconds: DEFAULT_CONNECTION_TIMEOUT),
+        timeout ??= const Duration(seconds: 20),
         onTimeout: () => _onTimeout(timeout: timeout));
     return result as Map<dynamic, dynamic>;
   }

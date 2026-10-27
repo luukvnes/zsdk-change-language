@@ -1,6 +1,9 @@
 package com.plugin.flutter.zsdk;
 
 import android.annotation.SuppressLint;
+import android.content.BroadcastReceiver;
+import android.content.Intent;
+import android.content.IntentFilter;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothDevice;
 import android.content.Context;
@@ -14,15 +17,13 @@ import com.zebra.sdk.comm.Connection;
 import com.zebra.sdk.printer.PrinterLanguage;
 import com.zebra.sdk.printer.ZebraPrinter;
 import com.zebra.sdk.printer.ZebraPrinterFactory;
-import com.zebra.sdk.printer.discovery.BluetoothDiscoverer;
-import com.zebra.sdk.printer.discovery.DiscoveredPrinter;
-import com.zebra.sdk.printer.discovery.DiscoveryHandler;
 
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.HashSet;
 
 import io.flutter.embedding.engine.plugins.FlutterPlugin;
 import io.flutter.plugin.common.BinaryMessenger;
@@ -37,6 +38,9 @@ public class ZsdkPlugin implements FlutterPlugin, MethodCallHandler {
 
   private Connection activeBluetoothConnection = null;
   private String connectedBluetoothAddress = null;
+
+  /** Max time (ms) to wait for native Bluetooth classic discovery to finish. */
+  private static final long DISCOVERY_TIMEOUT_MS = 14000L;
 
   @Override
   public void onAttachedToEngine(@NonNull FlutterPluginBinding flutterPluginBinding) {
@@ -444,41 +448,122 @@ public class ZsdkPlugin implements FlutterPlugin, MethodCallHandler {
   }
 
   private void discoverBluetoothPrinters(Result result) {
-    new Thread(() -> {
-      try {
-        List<Map<String, String>> printerList = new ArrayList<>();
+    // Use Android's native Bluetooth classic discovery
+    // (BluetoothAdapter.startDiscovery) instead of the Zebra SDK's
+    // BluetoothDiscoverer, which relies on its own internal scan and often
+    // returns an empty list on recent Android versions.
+    final BluetoothAdapter bluetoothAdapter = BluetoothAdapter.getDefaultAdapter();
+    if (bluetoothAdapter == null) {
+      result.error("BLUETOOTH_NOT_AVAILABLE", "Bluetooth is not available on this device", null);
+      return;
+    }
+    if (!bluetoothAdapter.isEnabled()) {
+      result.error("BLUETOOTH_DISABLED", "Bluetooth is turned off", null);
+      return;
+    }
 
-        BluetoothDiscoverer.findPrinters(context, new DiscoveryHandler() {
-          @Override
-          public void foundPrinter(DiscoveredPrinter printer) {
-            Map<String, String> printerMap = new HashMap<>();
-            printerMap.put("address", printer.address);
-            String name = printer.getDiscoveryDataMap().get("FRIENDLY_NAME");
-            printerMap.put("name", name != null ? name : "Zebra Printer");
-            printerList.add(printerMap);
+    // Discovery callbacks are delivered on the main thread, so run the whole
+    // flow there.
+    new Handler(Looper.getMainLooper()).post(() ->
+        startNativeDiscovery(bluetoothAdapter, result));
+  }
+
+  @SuppressLint("MissingPermission")
+  private void startNativeDiscovery(BluetoothAdapter bluetoothAdapter, Result result) {
+    final Handler mainHandler = new Handler(Looper.getMainLooper());
+    final List<Map<String, String>> printerList = new ArrayList<>();
+    final Set<String> seenAddresses = new HashSet<>();
+    final boolean[] finished = new boolean[] { false };
+
+    final BroadcastReceiver[] receiverHolder = new BroadcastReceiver[1];
+    final Runnable[] timeoutHolder = new Runnable[1];
+
+    final Runnable finish = new Runnable() {
+      @Override
+      public void run() {
+        if (finished[0]) {
+          return;
+        }
+        finished[0] = true;
+        try {
+          if (bluetoothAdapter.isDiscovering()) {
+            bluetoothAdapter.cancelDiscovery();
           }
-
-          @Override
-          public void discoveryFinished() {
-            new Handler(Looper.getMainLooper()).post(() -> {
-              result.success(printerList);
-            });
+        } catch (Exception ignored) {
+        }
+        try {
+          if (receiverHolder[0] != null) {
+            context.unregisterReceiver(receiverHolder[0]);
           }
-
-          @Override
-          public void discoveryError(String message) {
-            new Handler(Looper.getMainLooper()).post(() -> {
-              result.error("DISCOVERY_ERROR", message, null);
-            });
-          }
-        });
-
-      } catch (Exception e) {
-        e.printStackTrace();
-        new Handler(Looper.getMainLooper()).post(() -> {
-          result.error("DISCOVERY_ERROR", "Failed to discover printers: " + e.getMessage(), null);
-        });
+        } catch (Exception ignored) {
+        }
+        if (timeoutHolder[0] != null) {
+          mainHandler.removeCallbacks(timeoutHolder[0]);
+        }
+        result.success(printerList);
       }
-    }).start();
+    };
+
+    final BroadcastReceiver receiver = new BroadcastReceiver() {
+      @Override
+      public void onReceive(Context ctx, Intent intent) {
+        String action = intent.getAction();
+        if (BluetoothDevice.ACTION_FOUND.equals(action)) {
+          try {
+            BluetoothDevice device = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
+            if (device == null) {
+              return;
+            }
+            String address = device.getAddress();
+            if (address == null || !seenAddresses.add(address)) {
+              return;
+            }
+            String name;
+            try {
+              name = device.getName();
+            } catch (SecurityException ignored) {
+              name = null;
+            }
+            Map<String, String> printerMap = new HashMap<>();
+            printerMap.put("address", address);
+            printerMap.put("name", name != null ? name : "Unknown");
+            printerList.add(printerMap);
+          } catch (Exception ignored) {
+          }
+        } else if (BluetoothAdapter.ACTION_DISCOVERY_FINISHED.equals(action)) {
+          finish.run();
+        }
+      }
+    };
+    receiverHolder[0] = receiver;
+
+    timeoutHolder[0] = finish;
+
+    try {
+      context.registerReceiver(receiver, new IntentFilter(BluetoothDevice.ACTION_FOUND));
+      context.registerReceiver(receiver, new IntentFilter(BluetoothAdapter.ACTION_DISCOVERY_FINISHED));
+
+      boolean started = bluetoothAdapter.startDiscovery();
+      if (!started) {
+        finish.run();
+        return;
+      }
+      mainHandler.postDelayed(timeoutHolder[0], DISCOVERY_TIMEOUT_MS);
+    } catch (SecurityException se) {
+      se.printStackTrace();
+      try {
+        context.unregisterReceiver(receiver);
+      } catch (Exception ignored) {
+      }
+      result.error("BLUETOOTH_PERMISSION_DENIED",
+          "Bluetooth scan/connect permission is required: " + se.getMessage(), null);
+    } catch (Exception e) {
+      e.printStackTrace();
+      try {
+        context.unregisterReceiver(receiver);
+      } catch (Exception ignored) {
+      }
+      result.error("DISCOVERY_ERROR", "Failed to discover printers: " + e.getMessage(), null);
+    }
   }
 }
